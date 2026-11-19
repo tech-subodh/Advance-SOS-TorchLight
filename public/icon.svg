@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="32%" r="72%">
+      <stop offset="0%" stop-color="#2b1e0a"/>
+      <stop offset="55%" stop-color="#111013"/>
+      <stop offset="100%" stop-color="#09090b"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="34%" r="44%">
+      <stop offset="0%" stop-color="#fde047" stop-opacity="0.55"/>
+      <stop offset="55%" stop-color="#f59e0b" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="beam" x1="256" y1="68" x2="256" y2="210" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#fef08a" stop-opacity="0.72"/>
+      <stop offset="100%" stop-color="#f59e0b" stop-opacity="0.06"/>
+    </linearGradient>
+    <linearGradient id="body" x1="256" y1="186" x2="256" y2="416" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#d97706"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <circle cx="256" cy="196" r="196" fill="url(#glow)"/>
+  <path d="M168 92 L344 92 L308 192 L204 192 Z" fill="url(#beam)"/>
+  <rect x="192" y="186" width="128" height="44" rx="14" fill="url(#body)"/>
+  <path d="M214 230 H298 L288 398 C287 414 274 426 258 426 H254 C238 426 225 414 224 398 L214 230 Z" fill="#27272a" stroke="#fbbf24" stroke-width="10"/>
+  <rect x="240" y="276" width="32" height="62" rx="16" fill="#fbbf24"/>
+  <circle cx="256" cy="296" r="7" fill="#18181b"/>
+</svg>

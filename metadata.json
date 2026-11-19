@@ -1,0 +1,11 @@
+{
+  "name": "टॉर्च लाइट - Torch Light",
+  "description": "पावरफुल फ्लैशलाइट, स्ट्रोब लाइट, आपातकालीन SOS सिग्नल और बहुरंगी स्क्रीन फ्लैशलाइट",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
