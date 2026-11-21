@@ -58,6 +58,7 @@ import {
   isMotionSensorSupported,
   requestMotionPermission,
   startShakeListener,
+  type ShakeTelemetry,
 } from './utils/shake';
 import {
   getProximitySensorMode,
@@ -238,6 +239,7 @@ export default function App() {
   });
   const [shakeError, setShakeError] = useState<string | null>(null);
   const [shakeTriggeredRecently, setShakeTriggeredRecently] = useState<boolean>(false);
+  const [shakeTelemetry, setShakeTelemetry] = useState<ShakeTelemetry | null>(null);
   const shakeToastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Pocket & Face-Down Proximity Auto-Off state
@@ -1108,10 +1110,16 @@ export default function App() {
   currentModeRef.current = currentMode;
 
   useEffect(() => {
-    if (!shakeEnabled) return;
+    if (!shakeEnabled) {
+      setShakeTelemetry(null);
+      return;
+    }
 
     const stopListening = startShakeListener({
       sensitivity: shakeSensitivity,
+      onReading: (reading) => {
+        setShakeTelemetry(reading);
+      },
       onShake: () => {
         // Do not interrupt an active emergency SOS broadcast
         if (isSosActiveRef.current) return;
@@ -1131,6 +1139,7 @@ export default function App() {
 
     return () => {
       stopListening();
+      setShakeTelemetry(null);
       if (shakeToastTimeoutRef.current) {
         clearTimeout(shakeToastTimeoutRef.current);
       }
@@ -2091,6 +2100,7 @@ export default function App() {
                 onChangeShakeSensitivity={handleChangeShakeSensitivity}
                 shakeError={shakeError}
                 shakeTriggeredRecently={shakeTriggeredRecently}
+                shakeTelemetry={shakeTelemetry}
                 proximityAutoOffEnabled={proximityAutoOffEnabled}
                 onToggleProximityAutoOff={() => void handleToggleProximityAutoOff()}
                 proximitySensorMode={proximitySensorMode}
@@ -2205,6 +2215,13 @@ export default function App() {
                 language={language}
                 messages={chatMessages}
                 setMessages={setChatMessages}
+                onBeforeStartVoice={() => {
+                  if (voiceEnabled || voiceListening) {
+                    setVoiceEnabled(false);
+                    setVoiceListening(false);
+                    setVoiceTranscript('');
+                  }
+                }}
               />
             )}
           </motion.div>

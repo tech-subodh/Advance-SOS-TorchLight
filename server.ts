@@ -1,8 +1,16 @@
 import 'dotenv/config';
+import http from 'http';
 import express, { type Request } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, type Content, type GenerateContentResponse } from '@google/genai';
+import { WebSocketServer, WebSocket } from 'ws';
+import {
+  GoogleGenAI,
+  Modality,
+  type Content,
+  type GenerateContentResponse,
+  type LiveServerMessage,
+} from '@google/genai';
 import type {
   AppPreferences,
   ChatMessage,
@@ -51,7 +59,48 @@ function resolvePort(): number {
 const PORT = resolvePort();
 const IS_PROD = process.env.NODE_ENV === 'production';
 
+// Strictly free-tier models only (no paid-only models or billing features enabled)
 const FREE_CHAT_MODEL = 'gemini-3.1-flash-lite';
+const FREE_LIVE_VOICE_MODEL = 'gemini-3.8-live';
+
+const ALLOWED_LIVE_VOICES = ['Zephyr', 'Puck', 'Charon', 'Kore', 'Fenrir'] as const;
+type AllowedLiveVoice = (typeof ALLOWED_LIVE_VOICES)[number];
+
+// Free-tier usage guardrails to protect user's free quota
+const FREE_CHAT_RPM_LIMIT = 15;
+const FREE_CHAT_WINDOW_MS = 60 * 1000;
+const MAX_CONCURRENT_LIVE_SESSIONS = 4;
+const MAX_LIVE_SESSION_DURATION_MS = 5 * 60 * 1000; // 5-minute cap per voice call
+
+const chatRateBuckets = new Map<string, number[]>();
+
+function checkFreeTierChatRateLimit(clientId: string): {
+  allowed: boolean;
+  retryAfterSec: number;
+} {
+  const now = Date.now();
+  const cutoff = now - FREE_CHAT_WINDOW_MS;
+  const recent = (chatRateBuckets.get(clientId) ?? []).filter((ts) => ts > cutoff);
+  if (recent.length >= FREE_CHAT_RPM_LIMIT) {
+    const oldest = recent[0] ?? now;
+    const retryAfterSec = Math.max(1, Math.ceil((oldest + FREE_CHAT_WINDOW_MS - now) / 1000));
+    chatRateBuckets.set(clientId, recent);
+    return { allowed: false, retryAfterSec };
+  }
+  recent.push(now);
+  chatRateBuckets.set(clientId, recent);
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function resolveLiveVoiceName(candidate: unknown): AllowedLiveVoice {
+  if (
+    typeof candidate === 'string' &&
+    (ALLOWED_LIVE_VOICES as readonly string[]).includes(candidate)
+  ) {
+    return candidate as AllowedLiveVoice;
+  }
+  return 'Zephyr';
+}
 
 function getClientId(req: Request): string {
   const fromHeader = req.header('x-client-id');
@@ -59,8 +108,8 @@ function getClientId(req: Request): string {
   return sanitizeClientId(fromHeader ?? fromQuery);
 }
 
-function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+function getGeminiClient(options?: { apiVersion?: string }): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     const err = new Error(
       'GEMINI_API_KEY is not configured. Please add your API key in Settings > Secrets.',
@@ -70,7 +119,9 @@ function getGeminiClient(): GoogleGenAI {
   }
   return new GoogleGenAI({
     apiKey,
+    ...(options?.apiVersion ? { apiVersion: options.apiVersion } : {}),
     httpOptions: {
+      ...(options?.apiVersion ? { apiVersion: options.apiVersion } : {}),
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -127,10 +178,15 @@ function formatGeminiError(err: unknown): { status: number; message: string } {
         'Free tier rate limit reached. Please wait a moment and try again, or check your Gemini API key in Settings > Secrets.',
     };
   }
-  if (rawMessage.includes('NOT_FOUND') || statusFromErr === 404) {
+  if (
+    rawMessage.includes('NOT_FOUND') ||
+    rawMessage.includes('Unexpected server response: 404') ||
+    statusFromErr === 404
+  ) {
     return {
       status: 404,
-      message: 'Requested assistant model is currently unavailable.',
+      message:
+        'Live voice endpoint or model returned 404. Please verify your free-tier Gemini API key in Settings > Secrets and try again.',
     };
   }
   return {
@@ -161,6 +217,8 @@ async function startServer() {
       ok: true,
       storageReady,
       assistantModel: FREE_CHAT_MODEL,
+      liveVoiceModel: FREE_LIVE_VOICE_MODEL,
+      tierPolicy: 'free-tier-only',
     });
   });
 
@@ -515,6 +573,14 @@ async function startServer() {
         return;
       }
 
+      const rateCheck = checkFreeTierChatRateLimit(clientId);
+      if (!rateCheck.allowed) {
+        res.status(429).json({
+          error: `Free-tier rate limit active (${FREE_CHAT_RPM_LIMIT} messages/min). Please wait ${rateCheck.retryAfterSec}s before sending another message.`,
+        });
+        return;
+      }
+
       const ai = getGeminiClient();
 
       const formattedHistory: Content[] = Array.isArray(history)
@@ -729,7 +795,290 @@ export class ErrorOverlay extends HTMLElement {}
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = http.createServer(app);
+
+  // 8. Real-Time Voice Conversations via Gemini Live API (gemini-3.8-live, Free Tier)
+  const liveWss = new WebSocketServer({
+    server: httpServer,
+    path: '/api/gemini/live',
+  });
+
+  const activeLiveSessionsByClient = new Map<string, () => void>();
+  let totalActiveLiveSessions = 0;
+
+  liveWss.on('connection', (clientWs, req) => {
+    const reqUrl = new URL(req.url ?? '/api/gemini/live', 'http://localhost');
+    const clientId = sanitizeClientId(reqUrl.searchParams.get('clientId') ?? undefined);
+    const lang = reqUrl.searchParams.get('lang') === 'en' ? 'en' : 'hi';
+    const voiceName = resolveLiveVoiceName(reqUrl.searchParams.get('voice'));
+
+    const sendJson = (payload: Record<string, unknown>) => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        try {
+          clientWs.send(JSON.stringify(payload));
+        } catch {
+          // ignore closed socket race
+        }
+      }
+    };
+
+    // Replace any stale session for the same client
+    const existingClose = activeLiveSessionsByClient.get(clientId);
+    if (existingClose) {
+      existingClose();
+    }
+
+    if (totalActiveLiveSessions >= MAX_CONCURRENT_LIVE_SESSIONS) {
+      sendJson({
+        type: 'error',
+        message:
+          lang === 'hi'
+            ? 'फ्री-टियर लाइव वॉइस सीमा पर है। कृपया कुछ देर बाद पुनः प्रयास करें।'
+            : 'Free-tier concurrent live voice session limit reached. Please try again shortly.',
+      });
+      clientWs.close(1013, 'Free-tier concurrency cap');
+      return;
+    }
+
+    // Gemini Live API (BidiGenerateContent) requires the v1beta endpoint
+    const LIVE_API_VERSION = 'v1beta';
+
+    let ai: GoogleGenAI;
+    try {
+      ai = getGeminiClient({ apiVersion: LIVE_API_VERSION });
+    } catch (err) {
+      const formatted = formatGeminiError(err);
+      console.error('[Gemini Live] Missing or invalid server GEMINI_API_KEY:', formatted.message);
+      sendJson({ type: 'error', message: formatted.message });
+      clientWs.close(1011, 'API key unavailable');
+      return;
+    }
+
+    let isClosed = false;
+    let isSessionReady = false;
+    let sessionCapTimer: ReturnType<typeof setTimeout> | null = null;
+    let liveSessionPromise: ReturnType<typeof ai.live.connect> | null = null;
+
+    totalActiveLiveSessions += 1;
+
+    const teardown = (closeClientWs = false) => {
+      if (isClosed) return;
+      isClosed = true;
+
+      if (sessionCapTimer) {
+        clearTimeout(sessionCapTimer);
+        sessionCapTimer = null;
+      }
+
+      if (activeLiveSessionsByClient.get(clientId) === teardown) {
+        activeLiveSessionsByClient.delete(clientId);
+      }
+      totalActiveLiveSessions = Math.max(0, totalActiveLiveSessions - 1);
+
+      if (liveSessionPromise) {
+        liveSessionPromise
+          .then((session) => {
+            try {
+              session.close();
+            } catch {
+              // ignore already closed
+            }
+          })
+          .catch(() => {});
+        liveSessionPromise = null;
+      }
+
+      if (
+        closeClientWs &&
+        (clientWs.readyState === WebSocket.OPEN ||
+          clientWs.readyState === WebSocket.CONNECTING)
+      ) {
+        try {
+          clientWs.close(1000, 'Session ended');
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    activeLiveSessionsByClient.set(clientId, () => teardown(true));
+
+    const systemInstruction =
+      lang === 'hi'
+        ? 'आप एक शांत, स्पष्ट और व्यावहारिक आपातकालीन सुरक्षा, फ्लैशलाइट, नाइट विज़न और सामान्य वॉइस सहायक हैं। उपयोगकर्ता की बोली गई भाषा (हिंदी, हिंग्लिश या अंग्रेज़ी) में संक्षिप्त, स्वाभाविक और सीधे बोलचाल वाले उत्तर दें।'
+        : 'You are a calm, practical emergency preparedness, lighting, and everyday voice assistant inside a flashlight app. Speak naturally, concisely, and clearly in whichever language the user speaks.';
+
+    console.log(
+      `[Gemini Live] Connecting upstream session (model=${FREE_LIVE_VOICE_MODEL}, apiVersion=${LIVE_API_VERSION}, voice=${voiceName}, lang=${lang})`,
+    );
+
+    liveSessionPromise = ai.live.connect({
+      model: FREE_LIVE_VOICE_MODEL,
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName },
+          },
+        },
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        systemInstruction,
+      },
+      callbacks: {
+        onopen: () => {
+          if (isClosed) return;
+          isSessionReady = true;
+          console.log(
+            `[Gemini Live] Upstream session open (model=${FREE_LIVE_VOICE_MODEL}, apiVersion=${LIVE_API_VERSION})`,
+          );
+          sendJson({
+            type: 'ready',
+            model: FREE_LIVE_VOICE_MODEL,
+            voiceName,
+            maxDurationSec: Math.round(MAX_LIVE_SESSION_DURATION_MS / 1000),
+          });
+
+          sessionCapTimer = setTimeout(() => {
+            if (isClosed) return;
+            sendJson({
+              type: 'error',
+              code: 'FREE_TIER_SESSION_LIMIT',
+              message:
+                lang === 'hi'
+                  ? 'फ्री-टियर की 5 मिनट की वॉइस सत्र सीमा पूरी हो गई है। आप नई बातचीत शुरू कर सकते हैं।'
+                  : 'Reached the 5-minute free-tier voice session limit. Start a new conversation anytime.',
+            });
+            teardown(true);
+          }, MAX_LIVE_SESSION_DURATION_MS);
+        },
+        onmessage: (message: LiveServerMessage) => {
+          if (isClosed) return;
+          const content = message.serverContent;
+
+          if (content?.inputTranscription?.text) {
+            sendJson({
+              type: 'inputTranscript',
+              text: content.inputTranscription.text,
+            });
+          }
+
+          if (content?.outputTranscription?.text) {
+            sendJson({
+              type: 'outputTranscript',
+              text: content.outputTranscription.text,
+            });
+          }
+
+          for (const part of content?.modelTurn?.parts ?? []) {
+            if (part.inlineData?.data) {
+              sendJson({
+                type: 'audio',
+                data: part.inlineData.data,
+              });
+            }
+          }
+
+          if (content?.interrupted) {
+            sendJson({ type: 'interrupted' });
+          }
+
+          if (content?.turnComplete) {
+            sendJson({ type: 'turnComplete' });
+          }
+        },
+        onerror: (err: unknown) => {
+          if (isClosed) return;
+          const errObj =
+            typeof err === 'object' && err !== null && 'message' in err
+              ? new Error(String((err as { message?: unknown }).message))
+              : err;
+          console.error('[Gemini Live] Upstream WebSocket error:', errObj);
+          const formatted = formatGeminiError(errObj);
+          sendJson({ type: 'error', message: formatted.message });
+          teardown(true);
+        },
+        onclose: (event?: { code?: number; reason?: string }) => {
+          if (isClosed) return;
+          const closeCode = event?.code ?? 1000;
+          const closeReason = event?.reason?.trim() ?? '';
+          if (closeCode !== 1000 || (!isSessionReady && closeReason)) {
+            console.error(
+              `[Gemini Live] Upstream closed abnormally (code=${closeCode}, reason=${closeReason || 'none'})`,
+            );
+            const formatted = formatGeminiError(
+              new Error(closeReason || `Live voice session closed (code ${closeCode}).`),
+            );
+            sendJson({ type: 'error', message: formatted.message });
+          } else {
+            sendJson({ type: 'closed', reason: closeReason });
+          }
+          teardown(true);
+        },
+      },
+    });
+
+    liveSessionPromise.catch((err) => {
+      if (isClosed) return;
+      console.error('[Gemini Live] Upstream connect rejected:', err);
+      const formatted = formatGeminiError(err);
+      sendJson({ type: 'error', message: formatted.message });
+      teardown(true);
+    });
+
+    clientWs.on('message', (raw) => {
+      if (isClosed || !liveSessionPromise) return;
+      let parsed: { type?: string; data?: string; text?: string };
+      try {
+        parsed = JSON.parse(raw.toString()) as {
+          type?: string;
+          data?: string;
+          text?: string;
+        };
+      } catch {
+        return;
+      }
+
+      if (parsed.type === 'audio' && typeof parsed.data === 'string' && parsed.data) {
+        const audioBase64 = parsed.data;
+        liveSessionPromise
+          .then((session) => {
+            if (isClosed) return;
+            session.sendRealtimeInput({
+              audio: {
+                data: audioBase64,
+                mimeType: 'audio/pcm;rate=16000',
+              },
+            });
+          })
+          .catch(() => {});
+      } else if (
+        parsed.type === 'text' &&
+        typeof parsed.text === 'string' &&
+        parsed.text.trim()
+      ) {
+        const textMsg = parsed.text.trim();
+        liveSessionPromise
+          .then((session) => {
+            if (isClosed) return;
+            session.sendRealtimeInput({ text: textMsg });
+          })
+          .catch(() => {});
+      } else if (parsed.type === 'stop') {
+        teardown(true);
+      }
+    });
+
+    clientWs.on('close', () => {
+      teardown(false);
+    });
+
+    clientWs.on('error', () => {
+      teardown(false);
+    });
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
 }

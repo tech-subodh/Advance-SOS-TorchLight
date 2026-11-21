@@ -12,6 +12,8 @@ import {
   SunMoon,
   Eye,
   Smartphone,
+  Activity,
+  RotateCcw,
 } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
@@ -49,6 +51,7 @@ import {
   TORCH_HAPTIC_PATTERNS,
   HAPTIC_PATTERNS,
 } from '../utils/audio';
+import { SHAKE_THRESHOLDS, type ShakeTelemetry } from '../utils/shake';
 
 interface TorchModeProps {
   isOn: boolean;
@@ -73,6 +76,7 @@ interface TorchModeProps {
   onChangeShakeSensitivity: (sensitivity: ShakeSensitivity) => void;
   shakeError: string | null;
   shakeTriggeredRecently: boolean;
+  shakeTelemetry: ShakeTelemetry | null;
   proximityAutoOffEnabled: boolean;
   onToggleProximityAutoOff: () => void;
   proximitySensorMode: ProximitySensorMode;
@@ -127,6 +131,7 @@ export const TorchMode: React.FC<TorchModeProps> = ({
   onChangeShakeSensitivity,
   shakeError,
   shakeTriggeredRecently,
+  shakeTelemetry,
   proximityAutoOffEnabled,
   onToggleProximityAutoOff,
   proximitySensorMode,
@@ -262,6 +267,38 @@ export const TorchMode: React.FC<TorchModeProps> = ({
 
   // Soft 'breath' transition state when dragging or toggling LED intensity presets
   const [isSliderDragging, setIsSliderDragging] = useState<boolean>(false);
+  const [shakePeakMagnitude, setShakePeakMagnitude] = useState<number>(0);
+
+  useEffect(() => {
+    if (!shakeEnabled) {
+      setShakePeakMagnitude(0);
+      return;
+    }
+    if (shakeTelemetry && shakeTelemetry.magnitude > shakePeakMagnitude) {
+      setShakePeakMagnitude(shakeTelemetry.magnitude);
+    }
+  }, [shakeEnabled, shakeTelemetry, shakePeakMagnitude]);
+
+  const activeShakeSource = shakeTelemetry?.source ?? 'linear';
+  const activeShakeThreshold =
+    shakeTelemetry?.threshold ??
+    (activeShakeSource === 'gravity-delta'
+      ? SHAKE_THRESHOLDS[shakeSensitivity].gravityDelta
+      : SHAKE_THRESHOLDS[shakeSensitivity].linear);
+  const shakeMeterMax = activeShakeSource === 'gravity-delta' ? 34 : 28;
+  const liveMagnitude = shakeTelemetry?.magnitude ?? 0;
+  const liveFillPercent = Math.min(100, Math.max(0, (liveMagnitude / shakeMeterMax) * 100));
+  const thresholdMarkerPercent = Math.min(
+    96,
+    Math.max(8, (activeShakeThreshold / shakeMeterMax) * 100),
+  );
+  const peakMarkerPercent = Math.min(
+    100,
+    Math.max(0, (shakePeakMagnitude / shakeMeterMax) * 100),
+  );
+  const peakExceededThreshold = shakePeakMagnitude >= activeShakeThreshold;
+  const isLiveOverThreshold = Boolean(shakeTelemetry?.isOverThreshold);
+
   const [isIntensityBreathing, setIsIntensityBreathing] = useState<boolean>(false);
   const [intensityBreathCycle, setIntensityBreathCycle] = useState<number>(0);
   const breathTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1114,33 +1151,228 @@ export const TorchMode: React.FC<TorchModeProps> = ({
           </button>
 
           {shakeEnabled && (
-            <div className="pt-2.5 border-t border-white/10 flex items-center justify-between gap-2">
-              <span className="text-[11px] font-medium text-neutral-300 whitespace-nowrap">
-                {t.torchMode.shakeSensitivity}
-              </span>
-              <div className="inline-flex items-center gap-1 p-1 rounded-xl glass-input">
-                {(
-                  [
-                    { id: 'low', label: t.torchMode.shakeLow },
-                    { id: 'medium', label: t.torchMode.shakeMedium },
-                    { id: 'high', label: t.torchMode.shakeHigh },
-                  ] as { id: ShakeSensitivity; label: string }[]
-                ).map((opt) => (
-                  <button
-                    key={opt.id}
-                    id={`shake-sensitivity-${opt.id}`}
-                    type="button"
-                    aria-pressed={shakeSensitivity === opt.id}
-                    onClick={() => onChangeShakeSensitivity(opt.id)}
-                    className={`min-h-[32px] px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all whitespace-nowrap ${
-                      shakeSensitivity === opt.id
-                        ? 'bg-amber-500/90 text-neutral-950 font-semibold shadow-sm'
-                        : 'text-neutral-300 hover:text-white'
-                    }`}
+            <div className="pt-2.5 border-t border-white/10 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-medium text-neutral-300 whitespace-nowrap">
+                  {t.torchMode.shakeSensitivity}
+                </span>
+                <div className="inline-flex items-center gap-1 p-1 rounded-xl glass-input">
+                  {(
+                    [
+                      { id: 'low', label: t.torchMode.shakeLow },
+                      { id: 'medium', label: t.torchMode.shakeMedium },
+                      { id: 'high', label: t.torchMode.shakeHigh },
+                    ] as { id: ShakeSensitivity; label: string }[]
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      id={`shake-sensitivity-${opt.id}`}
+                      type="button"
+                      aria-pressed={shakeSensitivity === opt.id}
+                      onClick={() => onChangeShakeSensitivity(opt.id)}
+                      className={`min-h-[32px] px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all whitespace-nowrap ${
+                        shakeSensitivity === opt.id
+                          ? 'bg-amber-500/90 text-neutral-950 font-semibold shadow-sm'
+                          : 'text-neutral-300 hover:text-white'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Real-Time Accelerometer Calibration Indicator */}
+              <div
+                id="shake-accelerometer-meter"
+                className="rounded-xl glass-surface p-3 space-y-2.5 border border-white/10"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <span
+                      className={`inline-flex h-2 w-2 rounded-full shrink-0 ${
+                        shakeTelemetry
+                          ? isLiveOverThreshold
+                            ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.85)]'
+                            : 'bg-amber-400 animate-pulse'
+                          : 'bg-neutral-500'
+                      }`}
+                    />
+                    <Activity
+                      className="w-3.5 h-3.5 text-amber-300 shrink-0"
+                      aria-hidden="true"
+                    />
+                    <span className="text-[11px] font-semibold text-white truncate">
+                      {t.torchMode.shakeLiveMeterTitle}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0 font-mono tabular-nums text-[11px]">
+                    <span
+                      className={`font-bold transition-colors ${
+                        isLiveOverThreshold
+                          ? 'text-emerald-300'
+                          : liveMagnitude >= activeShakeThreshold * 0.7
+                            ? 'text-amber-300'
+                            : 'text-neutral-200'
+                      }`}
+                    >
+                      {liveMagnitude.toFixed(1)}
+                    </span>
+                    <span className="text-neutral-500">/</span>
+                    <span className="text-amber-300/90 font-semibold">
+                      {activeShakeThreshold.toFixed(1)} m/s²
+                    </span>
+                  </div>
+                </div>
+
+                {/* Calibrated Force Bar with Sliding Sensitivity Threshold & Peak Marker */}
+                <div className="space-y-1.5">
+                  <div
+                    role="meter"
+                    aria-label={t.torchMode.shakeLiveMeterTitle}
+                    aria-valuemin={0}
+                    aria-valuemax={shakeMeterMax}
+                    aria-valuenow={Number(liveMagnitude.toFixed(1))}
+                    className="relative h-3 w-full rounded-full bg-black/45 border border-white/10 overflow-visible"
                   >
-                    {opt.label}
-                  </button>
-                ))}
+                    {/* Live Magnitude Fill */}
+                    <div
+                      className={`h-full rounded-full transition-[width,background-color] duration-75 ${
+                        isLiveOverThreshold
+                          ? 'bg-gradient-to-r from-amber-400 via-emerald-400 to-emerald-300 shadow-[0_0_12px_rgba(52,211,153,0.55)]'
+                          : liveMagnitude >= activeShakeThreshold * 0.65
+                            ? 'bg-gradient-to-r from-amber-500/80 to-amber-300'
+                            : 'bg-gradient-to-r from-sky-500/75 to-amber-400/85'
+                      }`}
+                      style={{
+                        width: `${shakeTelemetry ? Math.max(2, liveFillPercent) : 0}%`,
+                      }}
+                    />
+
+                    {/* Peak Hold Tick Marker */}
+                    {shakePeakMagnitude > 0.2 && (
+                      <div
+                        aria-hidden="true"
+                        className={`absolute -top-0.5 -bottom-0.5 w-1 rounded-full -translate-x-1/2 transition-all duration-150 ${
+                          peakExceededThreshold
+                            ? 'bg-emerald-300 shadow-[0_0_8px_rgba(52,211,153,0.85)]'
+                            : 'bg-white/80'
+                        }`}
+                        style={{ left: `${peakMarkerPercent}%` }}
+                      />
+                    )}
+
+                    {/* Dynamic Sensitivity Threshold Line */}
+                    <div
+                      aria-hidden="true"
+                      className="absolute -top-1 -bottom-1 w-[2px] -translate-x-1/2 bg-amber-300 shadow-[0_0_8px_rgba(251,191,36,0.9)] transition-all duration-200"
+                      style={{ left: `${thresholdMarkerPercent}%` }}
+                    >
+                      <span className="absolute -top-1 left-1/2 -translate-x-1/2 w-2 h-2 rotate-45 bg-amber-300 rounded-[1px]" />
+                    </div>
+                  </div>
+
+                  {/* Threshold & Peak Summary Row */}
+                  <div className="flex items-center justify-between gap-2 text-[10px]">
+                    <span className="text-neutral-400 flex items-center gap-1.5">
+                      <span>
+                        {t.torchMode.shakeThresholdLabel}:{' '}
+                        <strong className="font-mono text-amber-300">
+                          {activeShakeThreshold.toFixed(1)}
+                        </strong>
+                      </span>
+                      {shakeTelemetry && (
+                        <span className="px-1.5 py-0.5 rounded bg-white/[0.06] text-neutral-300">
+                          {activeShakeSource === 'linear'
+                            ? t.torchMode.shakeSensorLinear
+                            : t.torchMode.shakeSensorGravity}
+                        </span>
+                      )}
+                    </span>
+
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-mono tabular-nums text-neutral-300">
+                        {t.torchMode.shakePeakLabel}:{' '}
+                        <strong
+                          className={
+                            peakExceededThreshold ? 'text-emerald-300' : 'text-white'
+                          }
+                        >
+                          {shakePeakMagnitude.toFixed(1)}
+                        </strong>
+                      </span>
+                      {shakePeakMagnitude > 0 && (
+                        <button
+                          id="shake-peak-reset-btn"
+                          type="button"
+                          onClick={() => setShakePeakMagnitude(0)}
+                          aria-label={t.torchMode.shakePeakReset}
+                          title={t.torchMode.shakePeakReset}
+                          className="p-1 rounded-md bg-white/[0.06] hover:bg-white/[0.14] text-neutral-300 hover:text-white transition-colors"
+                        >
+                          <RotateCcw className="w-2.5 h-2.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Live 3-Axis (X / Y / Z) Breakdown */}
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { axis: 'X', value: shakeTelemetry?.x ?? 0 },
+                      { axis: 'Y', value: shakeTelemetry?.y ?? 0 },
+                      { axis: 'Z', value: shakeTelemetry?.z ?? 0 },
+                    ] as const
+                  ).map(({ axis, value }) => {
+                    const axisPercent = Math.min(50, (Math.abs(value) / 20) * 50);
+                    const isPositive = value >= 0;
+                    return (
+                      <div
+                        key={axis}
+                        className="rounded-lg bg-black/30 border border-white/[0.07] px-2 py-1.5 space-y-1"
+                      >
+                        <div className="flex items-center justify-between text-[10px] font-mono tabular-nums">
+                          <span className="font-bold text-neutral-400">{axis}</span>
+                          <span className="text-neutral-200">
+                            {value >= 0 ? '+' : ''}
+                            {value.toFixed(1)}
+                          </span>
+                        </div>
+                        <div className="relative h-1 w-full rounded-full bg-white/10 overflow-hidden">
+                          <span
+                            aria-hidden="true"
+                            className="absolute top-0 bottom-0 left-1/2 w-[1px] bg-white/25"
+                          />
+                          <div
+                            className="absolute top-0 bottom-0 rounded-full bg-amber-400/90 transition-all duration-75"
+                            style={{
+                              left: isPositive ? '50%' : `${50 - axisPercent}%`,
+                              width: `${shakeTelemetry ? Math.max(2, axisPercent) : 0}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Calibration Status Tip */}
+                <p
+                  className={`text-[10px] leading-snug ${
+                    peakExceededThreshold
+                      ? 'text-emerald-300/95 font-medium'
+                      : 'text-neutral-400'
+                  }`}
+                >
+                  {!shakeTelemetry
+                    ? t.torchMode.shakeWaitingSensor
+                    : peakExceededThreshold
+                      ? t.torchMode.shakeZoneReady
+                      : t.torchMode.shakeCalibrationTip}
+                </p>
               </div>
             </div>
           )}
